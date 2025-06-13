@@ -15,10 +15,11 @@ import numpy as np
 import utils
 from Dataloader.dataloader import get_dataloader
 from Dataloader.dataloader_utils import thresh_img
+from Dataloader.dataloader import ToTensor, RandomCrop
 import yaml
 import argparse
 
-use_parallel=False
+use_parallel = False
 
 EPS = 10e-5
 
@@ -26,44 +27,67 @@ parser = argparse.ArgumentParser()
 
 # config_file_path = 'Config/config_cmr.yaml'
 parser.add_argument(
-        "--config",
-        "-C",
-        help="Path for the config file",
-        type=str,
-        default="Config/config_cmr.yaml",
-        # default="Config/config_lct.yaml",
-        required=False,
-    )
+    "--config",
+    "-C",
+    help="Path for the config file",
+    type=str,
+    default="Config/config_synapse.yaml",
+    # default="Config/config_cmr.yaml",
+    # default="Config/config_lct.yaml",
+    required=False,
+)
+parser.add_argument('-g', '--gpu', type=str, default='2')
+parser.add_argument('--root_path', type=str, default='/data/ssd1/ttzz/dataset/Synapse_h5', help='Name of Dataset')
+parser.add_argument('--labelnum', type=int, default=4, help='labeled trained samples')
 args = parser.parse_args()
-#=======================================================================================================================
+# =======================================================================================================================
+os.environ['CUDA_VISIBLE_DEVICES'] = args.gpu
 
 # Load the YAML file into a dictionary
 with open(args.config, 'r') as file:
     hyp_parameters = yaml.safe_load(file)
     print(hyp_parameters)
 
-
+train_data_path = args.root_path
+patch_size = (96, 96, 96)
 
 # epoch_per_save=10
-epoch_per_save=hyp_parameters['epoch_per_save']
+epoch_per_save = hyp_parameters['epoch_per_save']
 
-data_name=hyp_parameters['data_name']
+data_name = hyp_parameters['data_name']
 net_name = hyp_parameters['net_name']
 
-Net=get_net(net_name)
+Net = get_net(net_name)
 
-suffix_pth=f'_{data_name}_{net_name}.pth'
-model_save_path = f'models/{data_name}_{net_name}/'
-model_dir=model_save_path
-transformer=utils.get_transformer(img_sz=hyp_parameters["ndims"]*[hyp_parameters['img_size']])
-Data_Loader=get_dataloader(hyp_parameters['data_name'],mode='train')
+suffix_pth = f'_{data_name}_{net_name}.pth'
+model_save_path = f'/data/ssd1/ttzz/project/DRDM/model/{data_name}_{net_name}/'
+model_dir = model_save_path
+transformer = utils.get_transformer(img_sz=hyp_parameters["ndims"] * [hyp_parameters['img_size']])
+Data_Loader = get_dataloader(hyp_parameters['data_name'], mode='train')
 
 tsfm = torchvision.transforms.Compose([
-            torchvision.transforms.ToTensor(),
-            ])
+    RandomCrop(patch_size),
+    ToTensor(),
+])
+if args.labelnum == 2:
+    # 10%, 2 labeld
+    labeled_list = ['0023', '0028']
+    unlabeled_list = ['0001', '0002', '0003', '0005', '0008', '0009', '0021', '0022', '0024', '0027', '0029', '0030',
+                      '0031', '0032', '0034', '0037', '0038', '0039']
+elif args.labelnum == 4:
+    # 20%, 4 labeld
+    labeled_list = ['0002', '0023', '0034', '0039']
+    unlabeled_list = ['0001', '0003', '0005', '0008', '0009', '0021', '0022', '0024', '0027', '0028', '0029', '0030',
+                      '0031', '0032', '0037', '0038']
+else:
+    print('Error labelnum!')
+    os.exit()
 
-
-dataset = Data_Loader(target_res = [hyp_parameters["img_size"]]*hyp_parameters["ndims"], transforms=None, noise_scale=hyp_parameters['noise_scale'])
+# dataset = Data_Loader(target_res = [hyp_parameters["img_size"]]*hyp_parameters["ndims"], transforms=None, noise_scale=hyp_parameters['noise_scale'])
+dataset = Data_Loader(train_data_path,
+                      labeled_list,
+                      unlabeled_list,
+                      tsfm)
 train_loader = DataLoader(
     dataset,
     batch_size=hyp_parameters['batchsize'],
@@ -72,19 +96,16 @@ train_loader = DataLoader(
     drop_last=True,
 )
 
-
-
 Deformddpm = DeformDDPM(
     # network=Net(n_steps=hyp_parameters["timesteps"],ndims=ndims,num_input_chn=num_input_chn,res=hyp_parameters['img_size']),
     network=Net(n_steps=hyp_parameters["timesteps"], ndims=hyp_parameters["ndims"], num_input_chn=1),
     n_steps=hyp_parameters["timesteps"],
-    image_chw=[1] + [hyp_parameters["img_size"]]*hyp_parameters["ndims"],
+    image_chw=[1] + [hyp_parameters["img_size"]] * hyp_parameters["ndims"],
     device=hyp_parameters["device"],
     batch_size=hyp_parameters["batchsize"],
     img_pad_mode=hyp_parameters["img_pad_mode"],
     v_scale=hyp_parameters["v_scale"],
 )
-
 
 # ddf_enc = DDF_Encoder(ndims=ndims,img_sz = hyp_parameters['img_size'], batch_sz = hyp_parameters['batchsize'])
 ddf_stn = STN(
@@ -131,8 +152,8 @@ if model_files:
     initial_epoch = int(latest_model_file.split('/')[-1].split('.')[0][:6]) + 1
 else:
     initial_epoch = 0
-print('len_train_data: ',len(dataset))
-for epoch in range(initial_epoch,hyp_parameters["epoch"]):
+print('len_train_data: ', len(dataset))
+for epoch in range(initial_epoch, hyp_parameters["epoch"]):
 
     epoch_loss_tot = 0.0
     epoch_loss_gen_d = 0.0
@@ -145,17 +166,18 @@ for epoch in range(initial_epoch,hyp_parameters["epoch"]):
         # x0, _ = batch
         x0, _, _ = batch
         x0 = x0.to(hyp_parameters["device"]).type(torch.float32)
-      
+
         n = x0.size()[0]  # batch_size -> n
         x0 = x0.to(hyp_parameters["device"])
         # random deformation + rotation
-        if hyp_parameters["ndims"]>2:
-            if np.random.uniform(0,1)<0.6:
+        if hyp_parameters["ndims"] > 2:
+            if np.random.uniform(0, 1) < 0.6:
                 x0 = utils.random_resample(x0, deform_scale=0)
         x0 = transformer(x0)
-        if hyp_parameters['noise_scale']>0:
-            x0 = thresh_img(x0, [0, 2*hyp_parameters['noise_scale']])
-            x0 = x0 * (np.random.normal(1, hyp_parameters['noise_scale'] * 1)) + np.random.normal(0, hyp_parameters['noise_scale'] * 1)
+        if hyp_parameters['noise_scale'] > 0:
+            x0 = thresh_img(x0, [0, 2 * hyp_parameters['noise_scale']])
+            x0 = x0 * (np.random.normal(1, hyp_parameters['noise_scale'] * 1)) + np.random.normal(0, hyp_parameters[
+                'noise_scale'] * 1)
 
         # Picking some noise for each of the images in the batch, a timestep and the respective alpha_bars
         t = torch.randint(0, hyp_parameters["timesteps"], (n,)).to(
@@ -163,19 +185,19 @@ for epoch in range(initial_epoch,hyp_parameters["epoch"]):
         )  # pick up a seq of rand number from 0 to 'timestep'
 
         # noisy_imgs, dvf_I = ddf_enc(img= x0, t)
-        noisy_imgs, dvf_I,_ = Deformddpm(x0, t)
+        noisy_imgs, dvf_I, _ = Deformddpm(x0, t)
         # pre_dvf_I = Deformddpm.backward(noisy_imgs, t.reshape(16, -1))
         pre_dvf_I = Deformddpm.backward(noisy_imgs, t)
 
-        loss_tot=0
+        loss_tot = 0
 
         loss_ddf = loss_reg(pre_dvf_I)
         trm_pred = ddf_stn(pre_dvf_I, dvf_I)
-        loss_gen_d = loss_dist(pred=trm_pred,inv_lab=dvf_I,ddf_stn=None)
-        loss_gen_a = loss_ang(pred=trm_pred,inv_lab=dvf_I,ddf_stn=None)
+        loss_gen_d = loss_dist(pred=trm_pred, inv_lab=dvf_I, ddf_stn=None)
+        loss_gen_a = loss_ang(pred=trm_pred, inv_lab=dvf_I, ddf_stn=None)
 
         loss_tot += 1.0 * loss_gen_d + 1.0 * loss_gen_a
-        loss_tot +=10 * loss_ddf
+        loss_tot += 10 * loss_ddf
         optimizer.zero_grad()
         loss_tot.backward()
         optimizer.step()
@@ -186,17 +208,17 @@ for epoch in range(initial_epoch,hyp_parameters["epoch"]):
         epoch_loss_reg += loss_ddf.item() * len(x0) / len(train_loader.dataset)
         # print('step:',step,':', loss_tot.item(),'=',loss_gen_a.item(),'+', loss_gen_d.item(),'+',loss_ddf.item())
 
-    print(epoch,':', epoch_loss_tot,'=',epoch_loss_gen_a,'+', epoch_loss_gen_d,'+',epoch_loss_reg, ' (ang+dist+regul)')
+    print(epoch, ':', epoch_loss_tot, '=', epoch_loss_gen_a, '+', epoch_loss_gen_d, '+', epoch_loss_reg,
+          ' (ang+dist+regul)')
 
     # # LR schedular step ----- YHM
     # scheduler.step()
 
     if 0 == epoch % epoch_per_save:
-        save_dir=model_save_path + str(epoch).rjust(6, '0') + suffix_pth
+        save_dir = model_save_path + str(epoch).rjust(6, '0') + suffix_pth
         if os.path.exists(model_save_path):
             print(f"saved in {save_dir}")
         else:
             os.makedirs(os.path.dirname(model_save_path))
         # break   # FOR TESTING
         torch.save(Deformddpm.network.state_dict(), save_dir)
-        
